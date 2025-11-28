@@ -42,57 +42,52 @@ impl GraphStructurer {
     /// - if both returns are empty returns -> remove last statements and return None
     /// - if only one branch returns values -> return the other block to be appended after the if
     /// - if both return values -> choose the longer block (or none if equal)
-    fn expand_if(if_stat: &mut ast::If) -> Option<ast::Block> {
-        let mut then_block = if_stat.then_block.lock();
-        let mut else_block = if_stat.else_block.lock();
+   fn expand_if(if_stat: &mut ast::If) -> Option<ast::Block> {
+    let mut then_block = if_stat.then_block.lock();
+    let mut else_block = if_stat.else_block.lock();
 
-        let then_return = then_block.last().and_then(|s| s.as_return());
-        let else_return = else_block.last().and_then(|s| s.as_return());
+    let then_return = then_block.last().and_then(|s| s.as_return());
+    let else_return = else_block.last().and_then(|s| s.as_return());
 
-        match (then_return, else_return) {
-            (Some(then_r), Some(else_r)) => {
-                let then_empty = then_r.values.is_empty();
-                let else_empty = else_r.values.is_empty();
+    match (then_return, else_return) {
+        (Some(then_r), Some(else_r)) => {
+            let then_empty = then_r.values.is_empty();
+            let else_empty = else_r.values.is_empty();
 
-                match (then_empty, else_empty) {
-                    (true, true) => {
-                        then_block.pop();
-                        else_block.pop();
-                        None
-                    }
-                    (false, true) => {
-                        // keep then as-is; move else out to append after if
-                        Some(std::mem::take(&mut else_block))
-                    }
-                    (true, false) => {
-                        // swap then with else and invert condition
-                        let prev_then = std::mem::replace(&mut then_block, std::mem::take(&mut else_block));
-                        // invert condition and keep prev_then to append after if
-                        if_stat.condition =
-                            ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
-                                .reduce_condition();
-                        Some(prev_then)
-                    }
-                    (false, false) => {
-                        // both return values - pick the larger block to append (tie -> none)
-                        match then_block.len().cmp(&else_block.len()) {
-                            std::cmp::Ordering::Less => Some(std::mem::take(&mut else_block)),
-                            std::cmp::Ordering::Greater => {
-                                let prev_then = std::mem::replace(&mut then_block, std::mem::take(&mut else_block));
-                                if_stat.condition =
-                                    ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
-                                        .reduce_condition();
-                                Some(prev_then)
-                            }
-                            std::cmp::Ordering::Equal => None,
+            match (then_empty, else_empty) {
+                (true, true) => {
+                    then_block.pop();
+                    else_block.pop();
+                    None
+                }
+                (false, true) => {
+                    // Return else branch to append after if
+                    Some(std::mem::take(&mut else_block))
+                }
+                (true, false) => {
+                    // Swap, invert condition, return previous then
+                    let prev_then = std::mem::take(&mut then_block);
+                    then_block.extend(std::mem::take(&mut else_block));
+                    Self::invert_condition_unary(if_stat);
+                    Some(prev_then)
+                }
+                (false, false) => {
+                    match then_block.len().cmp(&else_block.len()) {
+                        std::cmp::Ordering::Less => Some(std::mem::take(&mut else_block)),
+                        std::cmp::Ordering::Greater => {
+                            let prev_then = std::mem::take(&mut then_block);
+                            then_block.extend(std::mem::take(&mut else_block));
+                            Self::invert_condition_unary(if_stat);
+                            Some(prev_then)
                         }
+                        std::cmp::Ordering::Equal => None,
                     }
                 }
             }
-            _ => None,
         }
+        _ => None,
     }
-
+}
     // a -> b -> d + a -> c -> d  => a -> d
     fn match_diamond_conditional(
         &mut self,
