@@ -2,6 +2,9 @@
 
 A blazingly fast Lua(u) decompiler, forked from [medal](https://github.com/shrimp-nz/medal).
 
+This was made with the help of Claude (AI), as I absolutely suck at RUST and would've not been able to make this complete.
+I only changed a few lines in some scripts.. so I don't take full credit; This is a LITTLE better than Shiny and if you wanna contribute to this, you can. You're probably better than me at this anyways.
+
 ## Usage
 
 ```bash
