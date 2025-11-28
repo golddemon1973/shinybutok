@@ -377,36 +377,53 @@ impl GraphStructurer {
             self.analyze_branch_continuations(post_dom, entry, then_node, else_node, header);
 
         let header_successors = self.function.successor_blocks(header).collect_vec();
-        let block = self.function.block_mut(entry).unwrap();
         
-        let Some(if_stat) = block.last_mut().unwrap().as_if_mut() else {
-            return false;
+        // First pass: modify the if statement blocks
+        let (then_empty, else_empty) = {
+            let block = self.function.block_mut(entry).unwrap();
+            
+            let Some(if_stat) = block.last_mut().unwrap().as_if_mut() else {
+                return false;
+            };
+
+            let mut changed = false;
+
+            // Handle then branch
+            if then_node == header && !header_successors.contains(&entry) && then_is_continue {
+                if_stat.then_block = Self::create_continue_block();
+                changed = true;
+            } else if Some(then_node) == next {
+                if_stat.then_block = Self::create_break_block();
+                changed = true;
+            }
+
+            // Handle else branch
+            if else_node == header && !header_successors.contains(&entry) && else_is_continue {
+                if_stat.else_block = Self::create_continue_block();
+                changed = true;
+            } else if Some(else_node) == next {
+                if_stat.else_block = Self::create_break_block();
+                changed = true;
+            }
+
+            if !changed {
+                return false;
+            }
+
+            // Check emptiness before releasing the borrow
+            (if_stat.then_block.lock().is_empty(), if_stat.else_block.lock().is_empty())
         };
 
-        let mut changed = false;
+        // Second pass: normalize edges based on emptiness (borrow released)
+        let edge_changed = self.normalize_conditional_edges_by_emptiness(
+            entry, 
+            then_node, 
+            else_node, 
+            then_empty, 
+            else_empty
+        );
 
-        // Handle then branch
-        if then_node == header && !header_successors.contains(&entry) && then_is_continue {
-            if_stat.then_block = Self::create_continue_block();
-            changed = true;
-        } else if Some(then_node) == next {
-            if_stat.then_block = Self::create_break_block();
-            changed = true;
-        }
-
-        // Handle else branch
-        if else_node == header && !header_successors.contains(&entry) && else_is_continue {
-            if_stat.else_block = Self::create_continue_block();
-            changed = true;
-        } else if Some(else_node) == next {
-            if_stat.else_block = Self::create_break_block();
-            changed = true;
-        }
-
-        // Normalize the conditional structure
-        changed |= self.normalize_conditional_edges(entry, if_stat, then_node, else_node);
-
-        changed
+        edge_changed
     }
 
     /// Analyzes whether branches should be treated as continuations.
@@ -442,21 +459,23 @@ impl GraphStructurer {
     }
 
     /// Normalizes conditional edges based on which branches are populated.
-    fn normalize_conditional_edges(
+    fn normalize_conditional_edges_by_emptiness(
         &mut self,
         entry: NodeIndex,
-        if_stat: &mut ast::If,
         then_node: NodeIndex,
         else_node: NodeIndex,
+        then_empty: bool,
+        else_empty: bool,
     ) -> bool {
-        let then_empty = if_stat.then_block.lock().is_empty();
-        let else_empty = if_stat.else_block.lock().is_empty();
-
         match (then_empty, else_empty) {
             // Only else has content - swap and use else node
             (true, false) => {
+                let block = self.function.block_mut(entry).unwrap();
+                let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
                 if_stat.condition = Self::negate_condition(&if_stat.condition);
                 std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
+                drop(block); // Explicitly drop to release borrow
+                
                 self.function.set_edges(
                     entry,
                     vec![(then_node, BlockEdge::new(BranchType::Unconditional))],
