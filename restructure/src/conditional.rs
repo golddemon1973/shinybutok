@@ -70,7 +70,7 @@ impl GraphStructurer {
 
     /// Helper to negate a condition and reduce it.
     #[inline]
-    fn negate_condition(condition: &ast::Expression) -> ast::Expression {
+    fn negate_condition(condition: &ast::Expr) -> ast::Expr {
         ast::Unary::new(condition.clone(), ast::UnaryOperation::Not).reduce_condition()
     }
 
