@@ -50,7 +50,8 @@ impl GraphStructurer {
             // Only else has values - swap and extract
             (true, false) => {
                 let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut else_block));
-                if_stat.condition = Self::negate_condition(&if_stat.condition);
+                if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
+                    .reduce_condition();
                 Some(extracted)
             }
             // Both have values - extract the longer block
@@ -59,19 +60,14 @@ impl GraphStructurer {
                     std::cmp::Ordering::Less => Some(std::mem::take(&mut else_block)),
                     std::cmp::Ordering::Greater => {
                         let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut else_block));
-                        if_stat.condition = Self::negate_condition(&if_stat.condition);
+                        if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
+                            .reduce_condition();
                         Some(extracted)
                     }
                     std::cmp::Ordering::Equal => None,
                 }
             }
         }
-    }
-
-    /// Helper to negate a condition and reduce it.
-    #[inline]
-    fn negate_condition(condition: &ast::Expr) -> ast::Expr {
-        ast::Unary::new(condition.clone(), ast::UnaryOperation::Not).reduce_condition()
     }
 
     /// Matches a diamond-shaped conditional pattern: a -> b -> d + a -> c -> d
@@ -239,7 +235,8 @@ impl GraphStructurer {
         
         // Normalize: ensure then_block is non-empty
         if if_stat.then_block.lock().is_empty() {
-            if_stat.condition = Self::negate_condition(&if_stat.condition);
+            if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
+                .reduce_condition();
             std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
         }
 
@@ -305,7 +302,8 @@ impl GraphStructurer {
         if_stat.then_block = Arc::new(branch_block.into());
 
         if invert_condition {
-            if_stat.condition = Self::negate_condition(&if_stat.condition);
+            if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
+                .reduce_condition();
         }
 
         self.function.set_edges(
@@ -472,7 +470,8 @@ impl GraphStructurer {
             (true, false) => {
                 let block = self.function.block_mut(entry).unwrap();
                 let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
-                if_stat.condition = Self::negate_condition(&if_stat.condition);
+                if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
+                    .reduce_condition();
                 std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
                 drop(block); // Explicitly drop to release borrow
                 
