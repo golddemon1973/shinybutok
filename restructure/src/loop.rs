@@ -169,11 +169,17 @@ impl GraphStructurer {
             body_ast
         };
 
+        // Get statements before borrowing init_ast
         let init_ast = self.function.block_mut(init_block).unwrap();
         init_ast.extend(statements);
         
+        // Drop the borrow before calling create_for_statement
+        drop(init_ast);
+        
         let new_stat = self.create_for_statement(statement, init_block, init_index, body_ast);
-        init_ast.push(new_stat);
+        
+        // Re-borrow to push the new statement
+        self.function.block_mut(init_block).unwrap().push(new_stat);
         
         self.function.remove_block(header);
         self.set_unconditional_edge_and_match(init_block, Some(else_node));
@@ -260,11 +266,18 @@ impl GraphStructurer {
         let (init_block, init_index) = self.find_for_init(header);
 
         let body_ast: ast::Block = statements.to_vec().into();
+        
+        // Extend init_ast with statements
         let init_ast = self.function.block_mut(init_block).unwrap();
         init_ast.extend(statements);
         
+        // Drop the borrow before calling create_for_statement
+        drop(init_ast);
+        
         let new_stat = self.create_for_statement(statement, init_block, init_index, body_ast);
-        init_ast.push(new_stat);
+        
+        // Re-borrow to push the new statement
+        self.function.block_mut(init_block).unwrap().push(new_stat);
         
         self.function.remove_block(header);
         self.set_unconditional_edge_and_match(init_block, next);
@@ -482,11 +495,17 @@ impl GraphStructurer {
             let mut body_ast = self.function.remove_block(body).unwrap();
             body_ast.extend(statements.iter().cloned());
             
+            // Extend init_ast with statements
             let init_ast = self.function.block_mut(init_block).unwrap();
             init_ast.extend(statements);
             
+            // Drop the borrow before calling create_for_statement
+            drop(init_ast);
+            
             let new_stat = self.create_for_statement(statement, init_block, init_index, body_ast);
-            init_ast.push(new_stat);
+            
+            // Re-borrow to push the new statement
+            self.function.block_mut(init_block).unwrap().push(new_stat);
             
             self.function.remove_block(header);
             self.set_unconditional_edge_and_match(init_block, Some(next));
