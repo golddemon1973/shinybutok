@@ -141,7 +141,7 @@ impl Type {
     /// Simplifies the type by merging redundant unions/intersections
     pub fn simplify(self) -> Self {
         match self {
-            Self::Union(mut types) => {
+            Self::Union(types) => {
                 // Remove Any from union (Any | T = Any)
                 if types.iter().any(|t| matches!(t, Self::Any)) {
                     return Self::Any;
@@ -149,7 +149,7 @@ impl Type {
 
                 // Flatten nested unions
                 let mut flattened = BTreeSet::new();
-                for t in types.drain(..) {
+                for t in types {
                     match t.simplify() {
                         Self::Union(inner) => flattened.extend(inner),
                         simplified => {
@@ -164,10 +164,10 @@ impl Type {
                     _ => Self::Union(flattened),
                 }
             }
-            Self::Intersection(mut types) => {
+            Self::Intersection(types) => {
                 // Flatten nested intersections
                 let mut flattened = BTreeSet::new();
-                for t in types.drain(..) {
+                for t in types {
                     match t.simplify() {
                         Self::Intersection(inner) => flattened.extend(inner),
                         simplified => {
@@ -333,8 +333,8 @@ impl<'a> TypeSystem<'a> {
                     let _ = self.analyze_block(&mut repeat.block.lock());
                 }
                 crate::Statement::NumericFor(num_for) => {
-                    // Type the loop variable as number
-                    self.annotations.insert(&num_for.variable, Type::Number);
+                    // Type the loop variable (counter) as number
+                    self.annotations.insert(&num_for.counter.0, Type::Number);
                     let _ = self.analyze_block(&mut num_for.block.lock());
                 }
                 crate::Statement::GenericFor(gen_for) => {
@@ -348,10 +348,19 @@ impl<'a> TypeSystem<'a> {
                         .collect();
                     return_types.extend(types);
                 }
-                crate::Statement::LocalAssign(local_assign) => {
-                    for (local, rvalue) in local_assign.left.iter().zip(local_assign.right.iter_mut()) {
+                crate::Statement::Assign(assign) => {
+                    // Handle regular assignments
+                    for (lvalue, rvalue) in assign.left.iter().zip(assign.right.iter_mut()) {
                         let inferred_type = self.infer_rvalue(rvalue);
-                        self.annotations.insert(local, inferred_type);
+                        if let crate::LValue::Local(local) = lvalue {
+                            if assign.prefix {
+                                // This is a local declaration
+                                self.annotations.insert(local, inferred_type);
+                            } else {
+                                // This is a reassignment
+                                self.update_local_type(local, inferred_type);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -389,12 +398,12 @@ impl<'a> TypeSystem<'a> {
                 // Most binary operations return specific types
                 match binary.operation {
                     crate::BinaryOperation::Add
-                    | crate::BinaryOperation::Subtract
-                    | crate::BinaryOperation::Multiply
-                    | crate::BinaryOperation::Divide
-                    | crate::BinaryOperation::Modulo
-                    | crate::BinaryOperation::Power
-                    | crate::BinaryOperation::IntegerDivide => Type::Number,
+                    | crate::BinaryOperation::Sub
+                    | crate::BinaryOperation::Mul
+                    | crate::BinaryOperation::Div
+                    | crate::BinaryOperation::Mod
+                    | crate::BinaryOperation::Pow
+                    | crate::BinaryOperation::IDiv => Type::Number,
                     
                     crate::BinaryOperation::Concat => Type::String,
                     
