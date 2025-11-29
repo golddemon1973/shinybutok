@@ -12,6 +12,7 @@ use petgraph::{algo::dominators::Dominators, stable_graph::NodeIndex};
 impl GraphStructurer {
     /// Simplifies an if statement by removing unnecessary negations.
     /// If the condition is a NOT operation, swap then/else blocks and remove the NOT.
+    #[inline]
     fn simplify_if(if_stat: &mut ast::If) {
         if let Some(unary) = if_stat.condition.as_unary() {
             if unary.operation == ast::UnaryOperation::Not {
@@ -23,6 +24,8 @@ impl GraphStructurer {
 
     /// Expands an if statement by extracting common return patterns.
     /// Returns the block that should be appended after the if statement, if any.
+    /// 
+    /// This helps prevent unnecessary gotos by pulling out common trailing code.
     fn expand_if(if_stat: &mut ast::If) -> Option<ast::Block> {
         let mut then_block = if_stat.then_block.lock();
         let mut else_block = if_stat.else_block.lock();
@@ -46,20 +49,20 @@ impl GraphStructurer {
                 None
             }
             // Only then has values - extract else block
-            (false, true) => Some(std::mem::take(&mut else_block)),
+            (false, true) => Some(std::mem::take(&mut *else_block)),
             // Only else has values - swap and extract
             (true, false) => {
-                let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut else_block));
+                let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut *else_block));
                 if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
                     .reduce_condition();
                 Some(extracted)
             }
-            // Both have values - extract the longer block
+            // Both have values - extract the longer block to minimize nesting
             (false, false) => {
                 match then_block.len().cmp(&else_block.len()) {
-                    std::cmp::Ordering::Less => Some(std::mem::take(&mut else_block)),
+                    std::cmp::Ordering::Less => Some(std::mem::take(&mut *else_block)),
                     std::cmp::Ordering::Greater => {
-                        let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut else_block));
+                        let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut *else_block));
                         if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
                             .reduce_condition();
                         Some(extracted)
@@ -70,6 +73,24 @@ impl GraphStructurer {
         }
     }
 
+    /// Checks if a block ends with a terminal statement (return/break/continue).
+    #[inline]
+    fn block_is_terminal(block: &ast::Block) -> bool {
+        block.last().map_or(false, |s| {
+            matches!(
+                s,
+                ast::Statement::Return(_) | ast::Statement::Break(_) | ast::Statement::Continue(_)
+            )
+        })
+    }
+
+    /// Checks if both branches of an if statement are terminal.
+    fn if_branches_are_terminal(if_stat: &ast::If) -> bool {
+        let then_terminal = Self::block_is_terminal(&if_stat.then_block.lock());
+        let else_terminal = Self::block_is_terminal(&if_stat.else_block.lock());
+        then_terminal && else_terminal
+    }
+
     /// Matches a diamond-shaped conditional pattern: a -> b -> d + a -> c -> d
     /// Results in: a -> d with merged blocks
     fn match_diamond_conditional(
@@ -78,8 +99,8 @@ impl GraphStructurer {
         then_node: NodeIndex,
         else_node: NodeIndex,
     ) -> bool {
-        let mut then_successors = self.function.successor_blocks(then_node).collect_vec();
-        let mut else_successors = self.function.successor_blocks(else_node).collect_vec();
+        let mut then_successors: Vec<_> = self.function.successor_blocks(then_node).collect();
+        let mut else_successors: Vec<_> = self.function.successor_blocks(else_node).collect();
 
         // Handle loop headers with back edges
         if then_successors.len() > 1 || else_successors.len() > 1 {
@@ -113,7 +134,7 @@ impl GraphStructurer {
             return false;
         }
 
-        self.merge_diamond_blocks(entry, then_node, else_node, then_successors.first().cloned())
+        self.merge_diamond_blocks(entry, then_node, else_node, then_successors.first().copied())
     }
 
     /// Handles removal of back edges to loop headers from successors.
@@ -149,8 +170,8 @@ impl GraphStructurer {
         then_successors: &[NodeIndex],
         else_successors: &[NodeIndex],
     ) -> bool {
-        (!then_has_back_edge && then_successors.len() == 1 || then_has_back_edge)
-            && (!else_has_back_edge && else_successors.len() == 1 || else_has_back_edge)
+        (then_successors.len() == 1 || then_has_back_edge)
+            && (else_successors.len() == 1 || else_has_back_edge)
     }
 
     /// Refines loop edges by inserting continue statements where appropriate.
@@ -163,14 +184,15 @@ impl GraphStructurer {
         else_has_back_edge: bool,
     ) -> bool {
         let mut refine_node = |node: NodeIndex| -> bool {
-            let (then_target, else_target) = self
+            let Some((then_target, else_target)) = self
                 .function
                 .conditional_edges(node)
-                .unwrap()
-                .map(|e| e.target());
+                .map(|(t, e)| (t.target(), e.target())) else {
+                return false;
+            };
 
             let block = self.function.block_mut(node).unwrap();
-            let Some(if_stat) = block.last_mut().unwrap().as_if_mut() else {
+            let Some(if_stat) = block.last_mut().and_then(|s| s.as_if_mut()) else {
                 return false;
             };
 
@@ -189,15 +211,7 @@ impl GraphStructurer {
         let then_changed = then_has_back_edge && refine_node(then_node);
         let else_changed = else_has_back_edge && refine_node(else_node);
 
-        if !then_changed && !else_changed {
-            return false;
-        }
-
-        if then_has_back_edge && else_has_back_edge {
-            debug_assert!(then_changed && else_changed, "Both edges should be refined");
-        }
-
-        true
+        then_changed || else_changed
     }
 
     /// Creates a block containing a single continue statement.
@@ -224,36 +238,45 @@ impl GraphStructurer {
         let else_block = self.function.remove_block(else_node).unwrap();
 
         let block = self.function.block_mut(entry).unwrap();
-        let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
+        let if_stat = block.last_mut().and_then(|s| s.as_if_mut()).unwrap();
         
-        if_stat.then_block = Arc::new(then_block.into());
-        if_stat.else_block = Arc::new(else_block.into());
+        if_stat.then_block = Arc::new(Mutex::new(then_block));
+        if_stat.else_block = Arc::new(Mutex::new(else_block));
         
         Self::simplify_if(if_stat);
 
         let after = Self::expand_if(if_stat);
         
-        // Normalize: ensure then_block is non-empty
-        if if_stat.then_block.lock().is_empty() {
+        // Normalize: ensure then_block is non-empty if possible
+        if if_stat.then_block.lock().is_empty() && !if_stat.else_block.lock().is_empty() {
             if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
                 .reduce_condition();
             std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
         }
 
+        // CRITICAL FIX: Check if both branches terminate
+        // If they do, we shouldn't try to connect to the exit node
+        let both_branches_terminal = Self::if_branches_are_terminal(if_stat);
+
         if let Some(after) = after {
             block.extend(after.0);
         }
 
+        // Only set edges if branches don't both terminate
         if let Some(exit) = exit {
-            self.function.set_edges(
-                entry,
-                vec![(exit, BlockEdge::new(BranchType::Unconditional))],
-            );
+            if !both_branches_terminal {
+                self.function.set_edges(
+                    entry,
+                    vec![(exit, BlockEdge::new(BranchType::Unconditional))],
+                );
+                self.match_jump(entry, Some(exit));
+            } else {
+                // Both branches terminate - no need for an exit edge
+                self.function.remove_edges(entry);
+            }
         } else {
             self.function.remove_edges(entry);
         }
-        
-        self.match_jump(entry, exit);
 
         true
     }
@@ -278,7 +301,7 @@ impl GraphStructurer {
         direct_node: NodeIndex,
         invert_condition: bool,
     ) -> bool {
-        let branch_successors = self.function.successor_blocks(branch_node).collect_vec();
+        let branch_successors: Vec<_> = self.function.successor_blocks(branch_node).collect();
 
         // Branch node must have at most one successor
         if branch_successors.len() > 1 {
@@ -296,22 +319,28 @@ impl GraphStructurer {
         }
 
         let branch_block = self.function.remove_block(branch_node).unwrap();
+        let branch_is_terminal = Self::block_is_terminal(&branch_block);
 
         let block = self.function.block_mut(entry).unwrap();
-        let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
-        if_stat.then_block = Arc::new(branch_block.into());
+        let if_stat = block.last_mut().and_then(|s| s.as_if_mut()).unwrap();
+        if_stat.then_block = Arc::new(Mutex::new(branch_block));
 
         if invert_condition {
             if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
                 .reduce_condition();
         }
 
-        self.function.set_edges(
-            entry,
-            vec![(direct_node, BlockEdge::new(BranchType::Unconditional))],
-        );
-
-        self.match_jump(entry, Some(direct_node));
+        // CRITICAL FIX: If the branch terminates (return/break/continue),
+        // don't create an edge to the direct node
+        if branch_is_terminal {
+            self.function.remove_edges(entry);
+        } else {
+            self.function.set_edges(
+                entry,
+                vec![(direct_node, BlockEdge::new(BranchType::Unconditional))],
+            );
+            self.match_jump(entry, Some(direct_node));
+        }
 
         true
     }
@@ -339,7 +368,7 @@ impl GraphStructurer {
 
         let block = self.function.block_mut(entry).unwrap();
         block.push(statement);
-        self.function.set_edges(entry, vec![]);
+        self.function.set_edges(entry, Vec::new());
         
         true
     }
@@ -357,7 +386,7 @@ impl GraphStructurer {
             .any(|n| {
                 post_dom
                     .dominators(entry)
-                    .is_some_and(|mut p| p.contains(&n))
+                    .map_or(false, |mut p| p.contains(&n))
             })
     }
 
@@ -374,13 +403,13 @@ impl GraphStructurer {
         let (then_is_continue, else_is_continue) = 
             self.analyze_branch_continuations(post_dom, entry, then_node, else_node, header);
 
-        let header_successors = self.function.successor_blocks(header).collect_vec();
+        let header_successors: Vec<_> = self.function.successor_blocks(header).collect();
         
         // First pass: modify the if statement blocks
-        let (then_empty, else_empty) = {
+        let (then_empty, else_empty, both_terminal) = {
             let block = self.function.block_mut(entry).unwrap();
             
-            let Some(if_stat) = block.last_mut().unwrap().as_if_mut() else {
+            let Some(if_stat) = block.last_mut().and_then(|s| s.as_if_mut()) else {
                 return false;
             };
 
@@ -408,17 +437,22 @@ impl GraphStructurer {
                 return false;
             }
 
-            // Check emptiness before releasing the borrow
-            (if_stat.then_block.lock().is_empty(), if_stat.else_block.lock().is_empty())
+            // Check properties before releasing the borrow
+            let then_empty = if_stat.then_block.lock().is_empty();
+            let else_empty = if_stat.else_block.lock().is_empty();
+            let both_terminal = Self::if_branches_are_terminal(if_stat);
+            
+            (then_empty, else_empty, both_terminal)
         };
 
-        // Second pass: normalize edges based on emptiness (borrow released)
-        let edge_changed = self.normalize_conditional_edges_by_emptiness(
+        // Second pass: normalize edges based on branch properties
+        let edge_changed = self.normalize_conditional_edges(
             entry, 
             then_node, 
             else_node, 
             then_empty, 
-            else_empty
+            else_empty,
+            both_terminal,
         );
 
         edge_changed
@@ -440,7 +474,7 @@ impl GraphStructurer {
             .any(|n| {
                 post_dom
                     .dominators(then_node)
-                    .is_some_and(|mut p| p.contains(&n))
+                    .map_or(false, |mut p| p.contains(&n))
             });
 
         let else_is_continue = self
@@ -450,30 +484,37 @@ impl GraphStructurer {
             .any(|n| {
                 post_dom
                     .dominators(else_node)
-                    .is_some_and(|mut p| p.contains(&n))
+                    .map_or(false, |mut p| p.contains(&n))
             });
 
         (then_is_continue, else_is_continue)
     }
 
-    /// Normalizes conditional edges based on which branches are populated.
-    fn normalize_conditional_edges_by_emptiness(
+    /// Normalizes conditional edges based on branch properties.
+    fn normalize_conditional_edges(
         &mut self,
         entry: NodeIndex,
         then_node: NodeIndex,
         else_node: NodeIndex,
         then_empty: bool,
         else_empty: bool,
+        both_terminal: bool,
     ) -> bool {
+        // CRITICAL FIX: If both branches are terminal, remove all edges
+        if both_terminal {
+            self.function.remove_edges(entry);
+            return true;
+        }
+
         match (then_empty, else_empty) {
             // Only else has content - swap and use else node
             (true, false) => {
                 let block = self.function.block_mut(entry).unwrap();
-                let if_stat = block.last_mut().unwrap().as_if_mut().unwrap();
+                let if_stat = block.last_mut().and_then(|s| s.as_if_mut()).unwrap();
                 if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
                     .reduce_condition();
                 std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
-                drop(block); // Explicitly drop to release borrow
+                drop(block);
                 
                 self.function.set_edges(
                     entry,
@@ -489,12 +530,12 @@ impl GraphStructurer {
                 );
                 true
             }
-            // Both have content - remove edges
+            // Both have content - remove edges (both branches handle their own flow)
             (false, false) => {
                 self.function.remove_edges(entry);
                 true
             }
-            // Both empty - no change
+            // Both empty - no change needed
             (true, true) => false,
         }
     }
@@ -506,14 +547,41 @@ impl GraphStructurer {
         then_node: NodeIndex,
         else_node: NodeIndex,
     ) -> bool {
-        let block = self.function.block_mut(entry).unwrap();
-        
-        // Skip if not an if statement (e.g., for loops)
-        if block.last_mut().unwrap().as_if_mut().is_none() {
-            return false;
+        // Verify this is actually an if statement
+        {
+            let block = self.function.block(entry).unwrap();
+            if block.last().and_then(|s| s.as_if()).is_none() {
+                return false;
+            }
         }
 
+        // Try to match known patterns
         self.match_diamond_conditional(entry, then_node, else_node)
             || self.match_triangle_conditional(entry, then_node, else_node)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_is_terminal_with_return() {
+        let mut block = ast::Block::default();
+        block.push(ast::Return { values: vec![] }.into());
+        assert!(GraphStructurer::block_is_terminal(&block));
+    }
+
+    #[test]
+    fn test_block_is_terminal_with_break() {
+        let mut block = ast::Block::default();
+        block.push(ast::Break {}.into());
+        assert!(GraphStructurer::block_is_terminal(&block));
+    }
+
+    #[test]
+    fn test_block_not_terminal() {
+        let block = ast::Block::default();
+        assert!(!GraphStructurer::block_is_terminal(&block));
     }
 }
