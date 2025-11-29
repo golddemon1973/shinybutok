@@ -16,6 +16,6 @@ impl NameGenerator for DefaultNameGenerator {
             },
             _ => None,
         };
-        hint.map(|hint| format!("v_{}_{}", identifier, hint))
+        hint.map(|hint| format!("v{}_{}", identifier, hint))
     }
 }
