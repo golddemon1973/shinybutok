@@ -9,10 +9,6 @@ use petgraph::{
 };
 use tuple::Map;
 
-mod conditional;
-mod jump;
-mod r#loop;
-
 /// Computes post-dominators for a control flow graph
 /// 
 /// Post-dominators are computed by adding a fake exit node connected to all 
@@ -74,6 +70,51 @@ impl GraphStructurer {
         block.iter().all(|s| s.as_comment().is_some())
     }
 
+    /// Removes trailing empty return statements
+    fn remove_last_return(mut block: ast::Block) -> ast::Block {
+        if let Some(ast::Statement::Return(last_statement)) = block.last() {
+            if last_statement.values.is_empty() {
+                block.0.pop();
+            }
+        }
+        block
+    }
+
+    /// Collects all goto destinations from a block recursively
+    fn collect_gotos(block: &ast::Block, gotos: &mut FxHashSet<ast::Label>) {
+        for statement in &block.0 {
+            match statement {
+                ast::Statement::Goto(goto) => {
+                    gotos.insert(goto.0.clone());
+                }
+                ast::Statement::If(r#if) => {
+                    Self::collect_gotos(&r#if.then_block.lock(), gotos);
+                    Self::collect_gotos(&r#if.else_block.lock(), gotos);
+                }
+                ast::Statement::While(r#while) => {
+                    Self::collect_gotos(&r#while.block.lock(), gotos);
+                }
+                ast::Statement::Repeat(repeat) => {
+                    Self::collect_gotos(&repeat.block.lock(), gotos);
+                }
+                ast::Statement::NumericFor(numeric_for) => {
+                    Self::collect_gotos(&numeric_for.block.lock(), gotos);
+                }
+                ast::Statement::GenericFor(generic_for) => {
+                    Self::collect_gotos(&generic_for.block.lock(), gotos);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// Load method implementations from other modules
+mod conditional;
+mod jump;
+mod r#loop;
+
+impl GraphStructurer {
     /// Attempts to match and collapse various control flow patterns
     fn try_match_pattern(
         &mut self,
@@ -236,44 +277,6 @@ impl GraphStructurer {
         self.label_to_node.insert(label.clone(), node);
         target_block.insert(0, label.clone().into());
         label
-    }
-
-    /// Removes trailing empty return statements
-    fn remove_last_return(mut block: ast::Block) -> ast::Block {
-        if let Some(ast::Statement::Return(last_statement)) = block.last() {
-            if last_statement.values.is_empty() {
-                block.0.pop();
-            }
-        }
-        block
-    }
-
-    /// Collects all goto destinations from a block recursively
-    fn collect_gotos(block: &ast::Block, gotos: &mut FxHashSet<ast::Label>) {
-        for statement in &block.0 {
-            match statement {
-                ast::Statement::Goto(goto) => {
-                    gotos.insert(goto.0.clone());
-                }
-                ast::Statement::If(r#if) => {
-                    Self::collect_gotos(&r#if.then_block.lock(), gotos);
-                    Self::collect_gotos(&r#if.else_block.lock(), gotos);
-                }
-                ast::Statement::While(r#while) => {
-                    Self::collect_gotos(&r#while.block.lock(), gotos);
-                }
-                ast::Statement::Repeat(repeat) => {
-                    Self::collect_gotos(&repeat.block.lock(), gotos);
-                }
-                ast::Statement::NumericFor(numeric_for) => {
-                    Self::collect_gotos(&numeric_for.block.lock(), gotos);
-                }
-                ast::Statement::GenericFor(generic_for) => {
-                    Self::collect_gotos(&generic_for.block.lock(), gotos);
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Determines if an edge should be converted to goto (heuristic-based)
