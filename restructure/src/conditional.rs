@@ -9,6 +9,19 @@ use tuple::Map;
 use crate::GraphStructurer;
 use petgraph::{algo::dominators::Dominators, stable_graph::NodeIndex};
 
+/// Represents the terminal status of an if statement's branches
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchTermination {
+    /// Neither branch terminates
+    None,
+    /// Only the then branch terminates
+    ThenOnly,
+    /// Only the else branch terminates
+    ElseOnly,
+    /// Both branches terminate
+    Both,
+}
+
 impl GraphStructurer {
     /// Simplifies an if statement by removing unnecessary negations.
     /// If the condition is a NOT operation, swap then/else blocks and remove the NOT.
@@ -30,6 +43,7 @@ impl GraphStructurer {
         let mut then_block = if_stat.then_block.lock();
         let mut else_block = if_stat.else_block.lock();
         
+        // Only expand if both blocks have return statements
         let then_return = then_block.last().and_then(|x| x.as_return());
         let else_return = else_block.last().and_then(|x| x.as_return());
         
@@ -42,16 +56,20 @@ impl GraphStructurer {
         let else_empty = else_return.values.is_empty();
 
         match (then_empty, else_empty) {
-            // Both returns are empty - remove both
+            // Both returns are empty - remove both returns
             (true, true) => {
                 then_block.pop();
                 else_block.pop();
                 None
             }
-            // Only then has values - extract else block
-            (false, true) => Some(std::mem::take(&mut *else_block)),
-            // Only else has values - swap and extract
+            // Only then has values - extract else block (it just has empty return)
+            (false, true) => {
+                else_block.pop(); // Remove the empty return
+                Some(std::mem::take(&mut *else_block))
+            }
+            // Only else has values - swap and extract then
             (true, false) => {
+                then_block.pop(); // Remove the empty return
                 let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut *else_block));
                 if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
                     .reduce_condition();
@@ -59,16 +77,8 @@ impl GraphStructurer {
             }
             // Both have values - extract the longer block to minimize nesting
             (false, false) => {
-                match then_block.len().cmp(&else_block.len()) {
-                    std::cmp::Ordering::Less => Some(std::mem::take(&mut *else_block)),
-                    std::cmp::Ordering::Greater => {
-                        let extracted = std::mem::replace(&mut *then_block, std::mem::take(&mut *else_block));
-                        if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
-                            .reduce_condition();
-                        Some(extracted)
-                    }
-                    std::cmp::Ordering::Equal => None,
-                }
+                // Don't extract if both have returns with values - keep the if structure
+                None
             }
         }
     }
@@ -84,11 +94,32 @@ impl GraphStructurer {
         })
     }
 
-    /// Checks if both branches of an if statement are terminal.
-    fn if_branches_are_terminal(if_stat: &ast::If) -> bool {
+    /// Analyzes the termination status of both branches
+    fn analyze_branch_termination(if_stat: &ast::If) -> BranchTermination {
         let then_terminal = Self::block_is_terminal(&if_stat.then_block.lock());
         let else_terminal = Self::block_is_terminal(&if_stat.else_block.lock());
-        then_terminal && else_terminal
+
+        match (then_terminal, else_terminal) {
+            (true, true) => BranchTermination::Both,
+            (true, false) => BranchTermination::ThenOnly,
+            (false, true) => BranchTermination::ElseOnly,
+            (false, false) => BranchTermination::None,
+        }
+    }
+
+    /// Checks if both branches of an if statement are empty
+    fn both_branches_empty(if_stat: &ast::If) -> bool {
+        if_stat.then_block.lock().is_empty() && if_stat.else_block.lock().is_empty()
+    }
+
+    /// Normalizes the if statement to prefer non-empty then branches
+    fn normalize_if_branches(if_stat: &mut ast::If) {
+        // If then is empty but else is not, swap them
+        if if_stat.then_block.lock().is_empty() && !if_stat.else_block.lock().is_empty() {
+            if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
+                .reduce_condition();
+            std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
+        }
     }
 
     /// Matches a diamond-shaped conditional pattern: a -> b -> d + a -> c -> d
@@ -243,39 +274,41 @@ impl GraphStructurer {
         if_stat.then_block = Arc::new(Mutex::new(then_block));
         if_stat.else_block = Arc::new(Mutex::new(else_block));
         
+        // Simplify NOT operations
         Self::simplify_if(if_stat);
 
+        // Try to extract common patterns
         let after = Self::expand_if(if_stat);
         
-        // Normalize: ensure then_block is non-empty if possible
-        if if_stat.then_block.lock().is_empty() && !if_stat.else_block.lock().is_empty() {
-            if_stat.condition = ast::Unary::new(if_stat.condition.clone(), ast::UnaryOperation::Not)
-                .reduce_condition();
-            std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
-        }
+        // Normalize empty branches
+        Self::normalize_if_branches(if_stat);
 
-        // CRITICAL FIX: Check if both branches terminate
-        // If they do, we shouldn't try to connect to the exit node
-        let both_branches_terminal = Self::if_branches_are_terminal(if_stat);
+        // Analyze termination status
+        let termination = Self::analyze_branch_termination(if_stat);
 
+        // Add any extracted statements after the if
         if let Some(after) = after {
             block.extend(after.0);
         }
 
-        // Only set edges if branches don't both terminate
-        if let Some(exit) = exit {
-            if !both_branches_terminal {
+        // Handle edges based on termination and exit
+        match (exit, termination) {
+            // No exit - always remove edges
+            (None, _) => {
+                self.function.remove_edges(entry);
+            }
+            // Both branches terminate - no continuation
+            (Some(_), BranchTermination::Both) => {
+                self.function.remove_edges(entry);
+            }
+            // At least one branch continues - need edge to exit
+            (Some(exit), BranchTermination::None | BranchTermination::ThenOnly | BranchTermination::ElseOnly) => {
                 self.function.set_edges(
                     entry,
                     vec![(exit, BlockEdge::new(BranchType::Unconditional))],
                 );
                 self.match_jump(entry, Some(exit));
-            } else {
-                // Both branches terminate - no need for an exit edge
-                self.function.remove_edges(entry);
             }
-        } else {
-            self.function.remove_edges(entry);
         }
 
         true
@@ -330,11 +363,12 @@ impl GraphStructurer {
                 .reduce_condition();
         }
 
-        // CRITICAL FIX: If the branch terminates (return/break/continue),
-        // don't create an edge to the direct node
+        // Handle edges based on whether branch terminates
         if branch_is_terminal {
+            // Branch terminates (return/break/continue) - no continuation
             self.function.remove_edges(entry);
         } else {
+            // Branch continues to direct_node
             self.function.set_edges(
                 entry,
                 vec![(direct_node, BlockEdge::new(BranchType::Unconditional))],
@@ -405,8 +439,8 @@ impl GraphStructurer {
 
         let header_successors: Vec<_> = self.function.successor_blocks(header).collect();
         
-        // First pass: modify the if statement blocks
-        let (then_empty, else_empty, both_terminal) = {
+        // Modify the if statement blocks
+        let (then_empty, else_empty, termination) = {
             let block = self.function.block_mut(entry).unwrap();
             
             let Some(if_stat) = block.last_mut().and_then(|s| s.as_if_mut()) else {
@@ -437,25 +471,16 @@ impl GraphStructurer {
                 return false;
             }
 
-            // Check properties before releasing the borrow
+            // Gather properties
             let then_empty = if_stat.then_block.lock().is_empty();
             let else_empty = if_stat.else_block.lock().is_empty();
-            let both_terminal = Self::if_branches_are_terminal(if_stat);
+            let termination = Self::analyze_branch_termination(if_stat);
             
-            (then_empty, else_empty, both_terminal)
+            (then_empty, else_empty, termination)
         };
 
-        // Second pass: normalize edges based on branch properties
-        let edge_changed = self.normalize_conditional_edges(
-            entry, 
-            then_node, 
-            else_node, 
-            then_empty, 
-            else_empty,
-            both_terminal,
-        );
-
-        edge_changed
+        // Normalize edges based on branch properties
+        self.normalize_conditional_edges(entry, then_node, else_node, then_empty, else_empty, termination)
     }
 
     /// Analyzes whether branches should be treated as continuations.
@@ -498,16 +523,16 @@ impl GraphStructurer {
         else_node: NodeIndex,
         then_empty: bool,
         else_empty: bool,
-        both_terminal: bool,
+        termination: BranchTermination,
     ) -> bool {
-        // CRITICAL FIX: If both branches are terminal, remove all edges
-        if both_terminal {
+        // If both branches terminate, remove all edges
+        if termination == BranchTermination::Both {
             self.function.remove_edges(entry);
             return true;
         }
 
         match (then_empty, else_empty) {
-            // Only else has content - swap and use else node
+            // Only else has content - swap and use else node target
             (true, false) => {
                 let block = self.function.block_mut(entry).unwrap();
                 let if_stat = block.last_mut().and_then(|s| s.as_if_mut()).unwrap();
@@ -516,27 +541,36 @@ impl GraphStructurer {
                 std::mem::swap(&mut if_stat.then_block, &mut if_stat.else_block);
                 drop(block);
                 
-                self.function.set_edges(
-                    entry,
-                    vec![(then_node, BlockEdge::new(BranchType::Unconditional))],
-                );
+                // Only set edge if the (now-then) branch doesn't terminate
+                if termination != BranchTermination::ElseOnly {
+                    self.function.set_edges(
+                        entry,
+                        vec![(then_node, BlockEdge::new(BranchType::Unconditional))],
+                    );
+                } else {
+                    self.function.remove_edges(entry);
+                }
                 true
             }
-            // Only then has content - use then node
+            // Only then has content - use then node target
             (false, true) => {
-                self.function.set_edges(
-                    entry,
-                    vec![(else_node, BlockEdge::new(BranchType::Unconditional))],
-                );
+                // Only set edge if then branch doesn't terminate
+                if termination != BranchTermination::ThenOnly {
+                    self.function.set_edges(
+                        entry,
+                        vec![(else_node, BlockEdge::new(BranchType::Unconditional))],
+                    );
+                } else {
+                    self.function.remove_edges(entry);
+                }
                 true
             }
-            // Both have content - remove edges (both branches handle their own flow)
-            (false, false) => {
+            // Both have content or both empty
+            (false, false) | (true, true) => {
+                // Remove edges - branches handle their own control flow
                 self.function.remove_edges(entry);
                 true
             }
-            // Both empty - no change needed
-            (true, true) => false,
         }
     }
 
@@ -583,5 +617,11 @@ mod tests {
     fn test_block_not_terminal() {
         let block = ast::Block::default();
         assert!(!GraphStructurer::block_is_terminal(&block));
+    }
+
+    #[test]
+    fn test_branch_termination_analysis() {
+        // This would require constructing If statements with proper blocks
+        // Left as a placeholder for integration testing
     }
 }
