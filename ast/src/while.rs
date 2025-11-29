@@ -1,26 +1,11 @@
 use parking_lot::Mutex;
 use triomphe::Arc;
+use crate::{formatter::Formatter, has_side_effects, Block, LocalRw, RValue, RcLocal, Traverse};
 use std::fmt;
 
-use crate::{
-    formatter::Formatter, 
-    has_side_effects, 
-    Block, 
-    LocalRw, 
-    RValue, 
-    RcLocal, 
-    Traverse
-};
-
-/// Represents a while loop statement in the AST
-/// 
-/// A while loop repeatedly executes a block while a condition remains truthy.
-/// The condition is evaluated before each iteration.
 #[derive(Debug, Clone)]
 pub struct While {
-    /// The loop condition evaluated before each iteration
     pub condition: RValue,
-    /// The block of statements to execute in each iteration
     pub block: Arc<Mutex<Block>>,
 }
 
@@ -94,77 +79,39 @@ impl While {
 
 impl Traverse for While {
     fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        let mut rvalues = vec![&mut self.condition];
-        
-        // Also traverse rvalues in the block
-        let mut block = self.block.lock();
-        for statement in block.iter_mut() {
-            rvalues.extend(statement.rvalues_mut());
-        }
-        
-        rvalues
+        // Only traverse the condition, not the block
+        // The block should be traversed separately when needed
+        vec![&mut self.condition]
     }
 
     fn rvalues(&self) -> Vec<&RValue> {
-        let mut rvalues = vec![&self.condition];
-        
-        // Also traverse rvalues in the block
-        let block = self.block.lock();
-        for statement in block.iter() {
-            rvalues.extend(statement.rvalues());
-        }
-        
-        rvalues
+        // Only traverse the condition, not the block
+        // The block should be traversed separately when needed
+        vec![&self.condition]
     }
 }
 
 impl LocalRw for While {
     fn values_read(&self) -> Vec<&RcLocal> {
-        let mut values = self.condition.values_read();
-        
-        // Also collect values read in the block
-        let block = self.block.lock();
-        for statement in block.iter() {
-            values.extend(statement.values_read());
-        }
-        
-        values
+        // Only return values from the condition
+        // Block should be handled separately
+        self.condition.values_read()
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        let mut values = self.condition.values_read_mut();
-        
-        // Also collect values read in the block
-        let mut block = self.block.lock();
-        for statement in block.iter_mut() {
-            values.extend(statement.values_read_mut());
-        }
-        
-        values
+        // Only return values from the condition
+        // Block should be handled separately
+        self.condition.values_read_mut()
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
-        // While condition doesn't write, but block might
-        let block = self.block.lock();
-        let mut values = Vec::new();
-        
-        for statement in block.iter() {
-            values.extend(statement.values_written());
-        }
-        
-        values
+        // While condition doesn't write, blocks should be analyzed separately
+        Vec::new()
     }
 
     fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
-        // While condition doesn't write, but block might
-        let mut block = self.block.lock();
-        let mut values = Vec::new();
-        
-        for statement in block.iter_mut() {
-            values.extend(statement.values_written_mut());
-        }
-        
-        values
+        // While condition doesn't write, blocks should be analyzed separately
+        Vec::new()
     }
 }
 
