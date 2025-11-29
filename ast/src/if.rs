@@ -193,72 +193,52 @@ impl If {
     }
 
     /// Attempts to simplify this if statement (e.g., empty branches, constant conditions)
-    pub fn simplify(self) -> Result<Statement, Self> {
-        // If condition is constant true, return then block
-        if let RValue::Literal(crate::Literal::Boolean(true)) = self.condition {
-            let then_statements = self.then_block.lock().0.clone();
-            return Ok(Statement::Block(then_statements.into()));
+    /// Returns None if the if statement should be removed entirely
+    pub fn simplify(mut self) -> Option<Self> {
+        // If condition is constant true, the if is unnecessary but we keep the then block
+        // The caller should extract the then_block statements
+        if matches!(self.condition, RValue::Literal(crate::Literal::Boolean(true))) {
+            // Condition is always true - just use then block
+            // Return None to signal the if should be replaced with its then block
+            return None;
         }
 
-        // If condition is constant false, return else block
-        if let RValue::Literal(crate::Literal::Boolean(false)) = self.condition {
-            let else_statements = self.else_block.lock().0.clone();
-            return Ok(Statement::Block(else_statements.into()));
+        // If condition is constant false, use else block
+        if matches!(self.condition, RValue::Literal(crate::Literal::Boolean(false))) {
+            // Condition is always false - just use else block
+            // Swap to then block and return None
+            self.then_block = self.else_block.clone();
+            self.else_block = Arc::new(Mutex::new(Block::default()));
+            return None;
         }
 
-        // If both blocks are empty, convert to expression statement
+        // If both blocks are empty and condition has no side effects, remove entirely
         if self.is_empty() && !self.condition.has_side_effects() {
-            return Ok(Statement::Comment(crate::Comment::new(
-                "Empty if statement removed".to_string()
-            )));
+            return None;
         }
 
         // If both blocks are identical, we can optimize this
         if self.then_block.lock().0 == self.else_block.lock().0 {
-            let statements = self.then_block.lock().0.clone();
-            return Ok(Statement::Block(statements.into()));
+            // Both branches do the same thing - the condition doesn't matter
+            return None;
         }
 
         // Cannot simplify further
-        Err(self)
+        Some(self)
     }
 }
 
 impl Traverse for If {
     fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        let mut rvalues = vec![&mut self.condition];
-        
-        // Traverse then block
-        let mut then_block = self.then_block.lock();
-        for statement in then_block.iter_mut() {
-            rvalues.extend(statement.rvalues_mut());
-        }
-        
-        // Traverse else block
-        let mut else_block = self.else_block.lock();
-        for statement in else_block.iter_mut() {
-            rvalues.extend(statement.rvalues_mut());
-        }
-        
-        rvalues
+        // Only traverse the condition, not the blocks
+        // The blocks should be traversed separately when needed
+        vec![&mut self.condition]
     }
 
     fn rvalues(&self) -> Vec<&RValue> {
-        let mut rvalues = vec![&self.condition];
-        
-        // Traverse then block
-        let then_block = self.then_block.lock();
-        for statement in then_block.iter() {
-            rvalues.extend(statement.rvalues());
-        }
-        
-        // Traverse else block
-        let else_block = self.else_block.lock();
-        for statement in else_block.iter() {
-            rvalues.extend(statement.rvalues());
-        }
-        
-        rvalues
+        // Only traverse the condition, not the blocks
+        // The blocks should be traversed separately when needed
+        vec![&self.condition]
     }
 }
 
@@ -286,71 +266,27 @@ impl SideEffects for If {
 
 impl LocalRw for If {
     fn values_read(&self) -> Vec<&RcLocal> {
-        let mut values = self.condition.values_read();
-        
-        // Collect from both blocks
-        let then_block = self.then_block.lock();
-        for statement in then_block.iter() {
-            values.extend(statement.values_read());
-        }
-        
-        let else_block = self.else_block.lock();
-        for statement in else_block.iter() {
-            values.extend(statement.values_read());
-        }
-        
-        values
+        // Only return values from the condition
+        // Blocks should be handled separately
+        self.condition.values_read()
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        let mut values = self.condition.values_read_mut();
-        
-        // Collect from both blocks
-        let mut then_block = self.then_block.lock();
-        for statement in then_block.iter_mut() {
-            values.extend(statement.values_read_mut());
-        }
-        
-        let mut else_block = self.else_block.lock();
-        for statement in else_block.iter_mut() {
-            values.extend(statement.values_read_mut());
-        }
-        
-        values
+        // Only return values from the condition
+        // Blocks should be handled separately
+        self.condition.values_read_mut()
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
-        let mut values = Vec::new();
-        
-        // Collect from both blocks
-        let then_block = self.then_block.lock();
-        for statement in then_block.iter() {
-            values.extend(statement.values_written());
-        }
-        
-        let else_block = self.else_block.lock();
-        for statement in else_block.iter() {
-            values.extend(statement.values_written());
-        }
-        
-        values
+        // If statements don't write directly, only through their blocks
+        // Blocks should be analyzed separately
+        Vec::new()
     }
 
     fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
-        let mut values = Vec::new();
-        
-        // Collect from both blocks
-        let mut then_block = self.then_block.lock();
-        for statement in then_block.iter_mut() {
-            values.extend(statement.values_written_mut());
-        }
-        
-        let mut else_block = self.else_block.lock();
-        for statement in else_block.iter_mut() {
-            values.extend(statement.values_written_mut());
-        }
-        
-        values
+        // If statements don't write directly, only through their blocks
+        // Blocks should be analyzed separately
+        Vec::new()
     }
 }
 
@@ -386,7 +322,8 @@ mod tests {
         let condition = RValue::Literal(Literal::Boolean(true));
         let if_stmt = If::new(condition, Block::default(), Block::default());
         
-        assert!(if_stmt.simplify().is_ok());
+        // Should return None (indicating the if can be removed/simplified)
+        assert!(if_stmt.simplify().is_none());
     }
 
     #[test]
@@ -394,7 +331,8 @@ mod tests {
         let condition = RValue::Literal(Literal::Boolean(false));
         let if_stmt = If::new(condition, Block::default(), Block::default());
         
-        assert!(if_stmt.simplify().is_ok());
+        // Should return None (indicating the if can be removed/simplified)
+        assert!(if_stmt.simplify().is_none());
     }
 
     #[test]
