@@ -6,7 +6,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use parking_lot::Mutex;
 use petgraph::{
-    algo::dominators::simple_fast,
+    algo::dominators::{simple_fast, Dominators},
     prelude::{DiGraph, NodeIndex},
     Direction,
 };
@@ -15,161 +15,313 @@ use triomphe::Arc;
 
 use crate::{Assign, Block, LocalRw, RcLocal, Statement};
 
+/// Node data in the control flow graph for local declaration analysis
+type BlockNode = (Option<Arc<Mutex<Block>>>, usize);
+
+/// Analyzes control flow to determine optimal local variable declaration positions
+/// 
+/// This struct builds a control flow graph from the AST and uses dominator analysis
+/// to find the earliest point where each local variable should be declared.
 #[derive(Default)]
 pub struct LocalDeclarer {
+    /// Maps blocks to their corresponding graph nodes
     block_to_node: FxHashMap<ByAddress<Arc<Mutex<Block>>>, NodeIndex>,
-    graph: DiGraph<(Option<Arc<Mutex<Block>>>, usize), ()>,
+    
+    /// Control flow graph: nodes are (block, statement_index), edges are control flow
+    graph: DiGraph<BlockNode, ()>,
+    
+    /// Tracks where each local is written/used: local -> {node -> first_statement_index}
     local_usages: IndexMap<RcLocal, FxHashMap<NodeIndex, usize>>,
+    
+    /// Final declaration positions: block -> {statement_index -> {locals}}
     declarations: FxHashMap<ByAddress<Arc<Mutex<Block>>>, BTreeMap<usize, IndexSet<RcLocal>>>,
 }
 
 impl LocalDeclarer {
+    /// Creates a new local declarer
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Visits a block and builds the control flow graph recursively
+    /// 
+    /// Returns the graph node for this block
     fn visit(&mut self, block: Arc<Mutex<Block>>, stat_index: usize) -> NodeIndex {
         let node = self.graph.add_node((Some(block.clone()), stat_index));
         self.block_to_node.insert(block.clone().into(), node);
-        for (stat_index, stat) in block.lock().iter().enumerate() {
-            // for loops already declare their own locals :)
-            if !matches!(stat, Statement::GenericFor(_) | Statement::NumericFor(_)) {
-                // we only visit locals written because locals are guaranteed to be written
-                // before they are read.
-                // TODO: move to seperate function and visit breadth-first?
-                for local in stat.values_written() {
-                    self.local_usages
-                        .entry(local.clone())
-                        .or_default()
-                        .entry(node)
-                        .or_insert(stat_index);
-                }
+        
+        let block_guard = block.lock();
+        
+        for (index, stat) in block_guard.iter().enumerate() {
+            // For loops declare their own loop variables, so skip them
+            if matches!(stat, Statement::GenericFor(_) | Statement::NumericFor(_)) {
+                continue;
             }
-            match stat {
-                Statement::If(r#if) => {
-                    let if_node = self.graph.add_node((None, stat_index));
-                    self.graph.add_edge(node, if_node, ());
-                    let then_node = self.visit(r#if.then_block.clone(), stat_index);
-                    self.graph.add_edge(if_node, then_node, ());
-                    let else_node = self.visit(r#if.else_block.clone(), stat_index);
-                    self.graph.add_edge(if_node, else_node, ());
-                }
-                Statement::While(r#while) => {
-                    let child = self.visit(r#while.block.clone(), stat_index);
-                    self.graph.add_edge(node, child, ());
-                }
-                Statement::Repeat(repeat) => {
-                    let child = self.visit(r#repeat.block.clone(), stat_index);
-                    self.graph.add_edge(node, child, ());
-                }
-                Statement::NumericFor(numeric_for) => {
-                    let child = self.visit(r#numeric_for.block.clone(), stat_index);
-                    self.graph.add_edge(node, child, ());
-                }
-                Statement::GenericFor(generic_for) => {
-                    let child = self.visit(r#generic_for.block.clone(), stat_index);
-                    self.graph.add_edge(node, child, ());
-                }
-                _ => {}
+
+            // Track where each local is written (locals are always written before read)
+            for local in stat.values_written() {
+                self.local_usages
+                    .entry(local.clone())
+                    .or_default()
+                    .entry(node)
+                    .or_insert(index);
             }
         }
+
+        // Visit nested control structures
+        for (index, stat) in block_guard.iter().enumerate() {
+            self.visit_statement(node, stat, index);
+        }
+        
+        drop(block_guard);
         node
     }
 
+    /// Visits a single statement and adds edges for control flow structures
+    fn visit_statement(&mut self, parent_node: NodeIndex, stat: &Statement, stat_index: usize) {
+        match stat {
+            Statement::If(r#if) => {
+                // Create intermediate node for the if statement
+                let if_node = self.graph.add_node((None, stat_index));
+                self.graph.add_edge(parent_node, if_node, ());
+                
+                // Visit both branches
+                let then_node = self.visit(r#if.then_block.clone(), stat_index);
+                self.graph.add_edge(if_node, then_node, ());
+                
+                let else_node = self.visit(r#if.else_block.clone(), stat_index);
+                self.graph.add_edge(if_node, else_node, ());
+            }
+            Statement::While(r#while) => {
+                let child = self.visit(r#while.block.clone(), stat_index);
+                self.graph.add_edge(parent_node, child, ());
+            }
+            Statement::Repeat(repeat) => {
+                let child = self.visit(r#repeat.block.clone(), stat_index);
+                self.graph.add_edge(parent_node, child, ());
+            }
+            Statement::NumericFor(numeric_for) => {
+                let child = self.visit(r#numeric_for.block.clone(), stat_index);
+                self.graph.add_edge(parent_node, child, ());
+            }
+            Statement::GenericFor(generic_for) => {
+                let child = self.visit(r#generic_for.block.clone(), stat_index);
+                self.graph.add_edge(parent_node, child, ());
+            }
+            _ => {}
+        }
+    }
+
+    /// Finds the common dominator for multiple usage nodes
+    fn find_common_dominator(
+        &self,
+        usages: &FxHashMap<NodeIndex, usize>,
+        dominators: &Dominators<NodeIndex>,
+    ) -> Option<NodeIndex> {
+        let node_dominators: Vec<Vec<_>> = usages
+            .keys()
+            .filter_map(|&node| dominators.dominators(node).map(|d| d.collect()))
+            .collect();
+
+        if node_dominators.is_empty() {
+            return None;
+        }
+
+        // Find intersection of all dominator sets
+        let mut common = node_dominators[0].clone();
+        for dominators in &node_dominators[1..] {
+            common = common.intersect(dominators.clone());
+        }
+
+        common.first().copied()
+    }
+
+    /// Finds the declaration position for a local with multiple usages
+    fn find_declaration_position(
+        &self,
+        usages: FxHashMap<NodeIndex, usize>,
+        dominators: &Dominators<NodeIndex>,
+    ) -> (NodeIndex, usize) {
+        if usages.len() == 1 {
+            return usages.into_iter().next().unwrap();
+        }
+
+        let node_dominators: Vec<Vec<_>> = usages
+            .keys()
+            .filter_map(|&node| dominators.dominators(node).map(|d| d.collect()))
+            .collect();
+
+        let common_dominator = self.find_common_dominator(&usages, dominators)
+            .expect("Should have at least one common dominator");
+
+        // Check if the common dominator itself uses this local
+        if let Some(&first_stat_index) = usages.get(&common_dominator) {
+            return (common_dominator, first_stat_index);
+        }
+
+        // Find the leftmost dominated child node
+        let first_stat_index = self
+            .find_leftmost_dominated_child(common_dominator, &node_dominators)
+            .expect("Should find at least one dominated child");
+
+        (common_dominator, first_stat_index)
+    }
+
+    /// Finds the leftmost (earliest) child node that's in the dominator sets
+    fn find_leftmost_dominated_child(
+        &self,
+        parent: NodeIndex,
+        node_dominators: &[Vec<NodeIndex>],
+    ) -> Option<usize> {
+        for child in self.graph.neighbors_directed(parent, Direction::Outgoing) {
+            for dominators in node_dominators {
+                if dominators.contains(&child) {
+                    return Some(self.graph.node_weight(child)?.1);
+                }
+            }
+        }
+        None
+    }
+
+    /// Walks up the graph to find the actual block node (skipping intermediate nodes)
+    fn find_actual_block_node(&self, mut node: NodeIndex, mut stat_index: usize) -> (NodeIndex, usize, Arc<Mutex<Block>>) {
+        loop {
+            let (block_opt, parent_stat_index) = self.graph.node_weight(node)
+                .expect("Node should exist in graph");
+
+            if let Some(block) = block_opt {
+                return (node, stat_index, block.clone());
+            }
+
+            // This is an intermediate node, walk up to parent
+            let parent = self
+                .graph
+                .neighbors_directed(node, Direction::Incoming)
+                .exactly_one()
+                .expect("Intermediate node should have exactly one parent");
+
+            node = parent;
+            stat_index = *parent_stat_index;
+        }
+    }
+
+    /// Converts an existing assignment into a local declaration if possible
+    fn try_convert_assignment_to_declaration(
+        &self,
+        statement: &mut Statement,
+        locals: &mut IndexSet<RcLocal>,
+    ) {
+        if let Statement::Assign(assign) = statement {
+            // Check if all left-hand sides are locals that we want to declare
+            let all_are_declared_locals = assign
+                .left
+                .iter()
+                .all(|lvalue| {
+                    lvalue.as_local().is_some_and(|l| locals.contains(l))
+                });
+
+            if all_are_declared_locals {
+                // Remove these locals from the set (they're already declared by assignment)
+                locals.retain(|local| {
+                    !assign
+                        .left
+                        .iter()
+                        .any(|lvalue| lvalue.as_local() == Some(local))
+                });
+                
+                // Mark as a prefixed declaration (local x = ...)
+                assign.prefix = true;
+            }
+        }
+    }
+
+    /// Inserts local declarations into blocks at computed positions
+    fn insert_declarations(&self, declarations: FxHashMap<ByAddress<Arc<Mutex<Block>>>, BTreeMap<usize, IndexSet<RcLocal>>>) {
+        for (ByAddress(block), decls) in declarations {
+            let mut block_guard = block.lock();
+            
+            // Process in reverse order to maintain correct indices
+            for (stat_index, mut locals) in decls.into_iter().rev() {
+                // Try to convert existing assignments to declarations
+                self.try_convert_assignment_to_declaration(
+                    &mut block_guard[stat_index],
+                    &mut locals,
+                );
+
+                // Insert remaining declarations as separate statements
+                if !locals.is_empty() {
+                    let declaration = Assign {
+                        left: locals.into_iter().map(Into::into).collect(),
+                        right: vec![],
+                        prefix: true,
+                        parallel: false,
+                    };
+                    block_guard.insert(stat_index, declaration.into());
+                }
+            }
+        }
+    }
+
+    /// Main entry point: analyzes control flow and declares locals optimally
+    /// 
+    /// # Arguments
+    /// * `root_block` - The root block to analyze
+    /// * `locals_to_ignore` - Locals that should not be declared (e.g., function parameters)
     pub fn declare_locals(
         mut self,
         root_block: Arc<Mutex<Block>>,
         locals_to_ignore: &FxHashSet<RcLocal>,
     ) {
+        // Build control flow graph
         let root_node = self.visit(root_block, 0);
+        
+        // Compute dominators
         let dominators = simple_fast(&self.graph, root_node);
+
+        // Determine declaration positions for each local
         for (local, usages) in self.local_usages {
             if locals_to_ignore.contains(&local) {
                 continue;
             }
-            let (mut node, mut first_stat_index) = if usages.len() == 1 {
-                usages.into_iter().next().unwrap()
-            } else {
-                let node_dominators = usages
-                    .keys()
-                    .map(|&n| dominators.dominators(n).unwrap().collect_vec())
-                    .collect_vec();
-                let mut dom_iter = node_dominators.iter().cloned();
-                let mut common_dominators = dom_iter.next().unwrap();
-                for node_dominators in dom_iter {
-                    common_dominators = common_dominators.intersect(node_dominators);
-                }
-                let common_dominator = common_dominators[0];
-                if let Some((_, first_stat_index)) =
-                    usages.into_iter().find(|&(n, _)| n == common_dominator)
-                {
-                    (common_dominator, first_stat_index)
-                } else {
-                    // find the left-most dominated node
-                    let mut first_stat_index = None;
-                    for child in self
-                        .graph
-                        .neighbors_directed(common_dominator, Direction::Outgoing)
-                    {
-                        for node_dominators in &node_dominators {
-                            if node_dominators.contains(&child) {
-                                first_stat_index = Some(self.graph.node_weight(child).unwrap().1);
-                            }
-                        }
-                    }
-                    (common_dominator, first_stat_index.unwrap())
-                }
-            };
-            while let (block, parent_stat_index) = self.graph.node_weight(node).unwrap()
-                && block.is_none()
-            {
-                let parent = self
-                    .graph
-                    .neighbors_directed(node, Direction::Incoming)
-                    .exactly_one()
-                    .unwrap();
-                (node, first_stat_index) = (parent, *parent_stat_index);
-            }
-            let block = self
-                .graph
-                .node_weight(node)
-                .unwrap()
-                .0
-                .as_ref()
-                .unwrap()
-                .clone();
+
+            let (node, first_stat_index) = 
+                self.find_declaration_position(usages, &dominators);
+
+            let (actual_node, actual_stat_index, block) = 
+                self.find_actual_block_node(node, first_stat_index);
+
+            // Record the declaration position
             self.declarations
                 .entry(block.into())
                 .or_default()
-                .entry(first_stat_index)
+                .entry(actual_stat_index)
                 .or_default()
                 .insert(local);
         }
 
-        for (ByAddress(block), declarations) in self.declarations {
-            let mut block = block.lock();
-            for (stat_index, mut locals) in declarations.into_iter().rev() {
-                match &mut block[stat_index] {
-                    Statement::Assign(assign)
-                        if assign
-                            .left
-                            .iter()
-                            .all(|l| l.as_local().is_some_and(|l| locals.contains(l))) =>
-                    {
-                        locals.retain(|l| {
-                            !assign
-                                .left
-                                .iter()
-                                .map(|l| l.as_local().unwrap())
-                                .contains(l)
-                        });
-                        assign.prefix = true;
-                    }
-                    _ => {}
-                }
-                if !locals.is_empty() {
-                    let mut declaration =
-                        Assign::new(locals.into_iter().map(|l| l.into()).collect_vec(), vec![]);
-                    declaration.prefix = true;
-                    block.insert(stat_index, declaration.into());
-                }
-            }
-        }
+        // Insert all declarations
+        self.insert_declarations(self.declarations);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_declarer_creation() {
+        let declarer = LocalDeclarer::new();
+        assert_eq!(declarer.graph.node_count(), 0);
+        assert!(declarer.local_usages.is_empty());
+    }
+
+    #[test]
+    fn test_empty_block() {
+        let declarer = LocalDeclarer::new();
+        let block = Arc::new(Mutex::new(Block::default()));
+        let ignore_set = FxHashSet::default();
+        
+        declarer.declare_locals(block, &ignore_set);
+        // Should complete without panicking
     }
 }
